@@ -14,15 +14,14 @@ from scipy.io.wavfile import write
 # ==============================
 SAMPLE_RATE = 16000
 SILENCE_TIMEOUT = 20
-SILENCE_FRAMES_REQUIRED = 15
+ENERGY_THRESHOLD = 0.00003
+SILENCE_DURATION = 0.8
 MIN_AUDIO_LENGTH = 0.5
-MAX_RECORD_SECONDS = 6
 
 # ==============================
 # LOAD MODEL
 # ==============================
-print("Loading Whisper model...")
-model = whisper.load_model("base")
+model = whisper.load_model("base")  # use "tiny" for faster
 
 # ==============================
 # STATE
@@ -31,15 +30,24 @@ audio_queue = queue.Queue()
 recording = []
 
 last_speech_time = time.time()
+last_voice_detected = time.time()
+
 is_listening = False
 is_speaking = False
-silence_frames = 0
 
 # ==============================
-# AUDIO CALLBACK
+# AUDIO INPUT CALLBACK
 # ==============================
 def audio_callback(indata, frames, time_info, status):
     audio_queue.put(indata.copy())
+
+
+# ==============================
+# SIMPLE VAD (ENERGY BASED)
+# ==============================
+def is_speech(audio_chunk):
+    return np.mean(np.abs(audio_chunk)) > ENERGY_THRESHOLD
+
 
 # ==============================
 # SAVE AUDIO
@@ -49,11 +57,13 @@ def save_wav(audio_data):
     write(temp.name, SAMPLE_RATE, audio_data)
     return temp.name
 
+
 # ==============================
 # STT
 # ==============================
 def transcribe(audio_np):
     path = save_wav(audio_np)
+
     try:
         result = model.transcribe(path)
         return result["text"].strip()
@@ -63,25 +73,23 @@ def transcribe(audio_np):
         except:
             pass
 
-# ==============================
-# TTS (FIXED - BLOCKING)
-# ==============================
-import comtypes
-comtypes.CoInitialize()
 
+# ==============================
+# TTS (THREAD SAFE)
+# ==============================
 def speak(text):
     global is_speaking
 
     if is_speaking:
-        return
+        return  # prevent overlap
 
     def run():
         global is_speaking
-
         is_speaking = True
-        try:
-            print(f"🤖 Agent: {text}")
 
+        print(f"🤖 Agent: {text}")
+
+        try:
             engine = pyttsx3.init()
             engine.setProperty("rate", 170)
 
@@ -94,102 +102,71 @@ def speak(text):
 
         finally:
             is_speaking = False
-            print("🎙️ Listening...")
+            print("Speak Now.....")
 
     threading.Thread(target=run, daemon=True).start()
 
+
 # ==============================
-# MICROPHONE CALIBRATION
+# MAIN LOOP
 # ==============================
-print("🎙️ Starting microphone...")
+print("🎙️ Agent is listening... Speak now!")
 
-with sd.InputStream(
-    samplerate=SAMPLE_RATE,
-    channels=1,
-    dtype='float32',
-    blocksize=1024,
-    callback=audio_callback,
-):
+with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, callback=audio_callback):
 
-    print("Calibrating... stay silent")
-
-    noise_samples = []
-    for _ in range(30):
-        chunk = audio_queue.get()
-        noise_samples.append(np.mean(np.abs(chunk)))
-
-    avg_noise = np.mean(noise_samples)
-
-    ENERGY_THRESHOLD = avg_noise * 4
-
-    print(f"✅ Threshold: {ENERGY_THRESHOLD:.6f}")
-    print("🎙️ Agent is listening... Speak now!")
-
-    # ==============================
-    # VAD
-    # ==============================
-    def is_speech(audio_chunk):
-        energy = np.mean(np.abs(audio_chunk))
-        return energy > ENERGY_THRESHOLD
-
-    # ==============================
-    # MAIN LOOP
-    # ==============================
     while True:
         audio_chunk = audio_queue.get()
-        current_time = time.time()
+
+        if audio_chunk is None:
+            continue
 
         speech = is_speech(audio_chunk)
-
-        # 🔴 IGNORE mic while speaking (KEY FIX)
-        if is_speaking:
-            continue
+        current_time = time.time()
 
         # ==========================
         # USER SPEAKING
         # ==========================
         if speech:
-            silence_frames = 0
             last_speech_time = current_time
+            last_voice_detected = current_time
+
+            # 🔥 INTERRUPT (basic safe version)
+            if is_speaking:
+                print("⚠️ Interrupt detected — stopping response")
+                is_speaking = False  # soft stop (best possible with pyttsx3)
+
             is_listening = True
             recording.append(audio_chunk)
 
         # ==========================
-        # USER SILENCE
+        # USER STOPPED SPEAKING
         # ==========================
         else:
-            silence_frames += 1
+            if is_listening and (current_time - last_voice_detected > SILENCE_DURATION):
 
-            if is_listening and (
-                silence_frames > SILENCE_FRAMES_REQUIRED
-                or len(recording) > SAMPLE_RATE * MAX_RECORD_SECONDS
-            ):
-
-                duration = sum(len(c) for c in recording) / SAMPLE_RATE
+                duration = sum(len(chunk) for chunk in recording) / SAMPLE_RATE
 
                 if duration < MIN_AUDIO_LENGTH:
                     recording = []
                     is_listening = False
-                    silence_frames = 0
                     continue
 
                 print("🧠 Processing speech...")
 
                 full_audio = np.concatenate(recording, axis=0)
+
                 text = transcribe(full_audio)
-
                 print(f"👤 You said: {text}")
-
-                # ✅ RESET BEFORE SPEAK (CRITICAL FIX)
-                recording = []
-                is_listening = False
-                silence_frames = 0
 
                 if text:
                     speak(f"You said: {text}")
 
+                # Reset
+                recording = []
+                is_listening = False
+
         # ==========================
-        # LONG SILENCE REMINDER
+        # SILENCE HANDLING
         # ==========================
         if current_time - last_speech_time > SILENCE_TIMEOUT:
             if not is_speaking:
