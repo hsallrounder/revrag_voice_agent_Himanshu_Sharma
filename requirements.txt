@@ -1,0 +1,8 @@
+livekit
+sounddevice
+numpy
+scipy
+# gtts
+pyttsx3
+openai-whisper
+python-dotenv
