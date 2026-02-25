@@ -1,11 +1,14 @@
 import whisper
-import tempfile
+import numpy as np
+import librosa
 
 model = whisper.load_model("base")
 
 def transcribe_audio(audio_bytes):
-    with tempfile.NamedTemporaryFile(suffix=".wav") as f:
-        f.write(audio_bytes)
-        f.flush()
-        result = model.transcribe(f.name)
-    return result["text"]
+    audio_np = np.frombuffer(audio_bytes, np.int16).astype(np.float32) / 32768.0
+    
+    # Resample 48kHz → 16kHz
+    audio_np = librosa.resample(audio_np, orig_sr=48000, target_sr=16000)
+
+    result = model.transcribe(audio_np)
+    return result["text"].strip()

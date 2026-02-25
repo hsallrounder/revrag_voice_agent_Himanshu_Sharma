@@ -2,6 +2,9 @@ livekit
 sounddevice
 numpy
 scipy
+edge-tts
 pyttsx3
 openai-whisper
 python-dotenv
+soundfile
+librosa

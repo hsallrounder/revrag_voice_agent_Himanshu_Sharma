@@ -1,197 +1,101 @@
-import sounddevice as sd
+import asyncio
 import numpy as np
-import queue
-import whisper
-import pyttsx3
-import os
-import time
-import tempfile
-import threading
-from scipy.io.wavfile import write
+from livekit_client import LiveKitClient
+from state_manager import StateManager
+from stt import transcribe_audio
+from vad import is_speech
+import soundfile as sf
+from tts import text_to_audio_bytes
 
-# ==============================
-# CONFIG
-# ==============================
 SAMPLE_RATE = 16000
-SILENCE_TIMEOUT = 20
-SILENCE_FRAMES_REQUIRED = 15
-MIN_AUDIO_LENGTH = 0.5
-MAX_RECORD_SECONDS = 6
-
-# ==============================
-# LOAD MODEL
-# ==============================
-print("Loading Whisper model...")
-model = whisper.load_model("base")
-
-# ==============================
-# STATE
-# ==============================
-audio_queue = queue.Queue()
-recording = []
-
-last_speech_time = time.time()
-is_listening = False
-is_speaking = False
+is_processing = False
 silence_frames = 0
+is_listening = False
 
-# ==============================
-# AUDIO CALLBACK
-# ==============================
-def audio_callback(indata, frames, time_info, status):
-    audio_queue.put(indata.copy())
+state = StateManager()
 
-# ==============================
-# SAVE AUDIO
-# ==============================
-def save_wav(audio_data):
-    temp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-    write(temp.name, SAMPLE_RATE, audio_data)
-    return temp.name
+def is_silence(audio_bytes, threshold=500):
+    audio_np = np.frombuffer(audio_bytes, np.int16)
+    return np.abs(audio_np).mean() < threshold
 
-# ==============================
-# STT
-# ==============================
-def transcribe(audio_np):
-    path = save_wav(audio_np)
-    try:
-        result = model.transcribe(path)
-        return result["text"].strip()
-    finally:
-        try:
-            os.remove(path)
-        except:
-            pass
 
-# ==============================
-# TTS (FIXED - BLOCKING)
-# ==============================
-import comtypes
-comtypes.CoInitialize()
+def audio_handler(audio_bytes, client):
+    global silence_frames, is_listening
 
-def speak(text):
-    global is_speaking
-
-    if is_speaking:
+    if state.is_speaking():
         return
 
-    def run():
-        global is_speaking
+    audio_np = np.frombuffer(audio_bytes, np.int16).astype(np.float32) / 32768.0
+    energy = np.mean(np.abs(audio_np))
 
-        is_speaking = True
-        try:
-            print(f"🤖 Agent: {text}")
+    SPEECH_THRESHOLD = 0.01  # adjust if needed
 
-            engine = pyttsx3.init()
-            engine.setProperty("rate", 170)
+    if energy > SPEECH_THRESHOLD:
+        silence_frames = 0
+        is_listening = True
+        state.add_audio(audio_bytes)
+    else:
+        silence_frames += 1
 
-            engine.say(text)
-            engine.runAndWait()
-            engine.stop()
-
-        except Exception as e:
-            print("TTS error:", e)
-
-        finally:
-            is_speaking = False
-            print("🎙️ Listening...")
-
-    threading.Thread(target=run, daemon=True).start()
-
-# ==============================
-# MICROPHONE CALIBRATION
-# ==============================
-print("🎙️ Starting microphone...")
-
-with sd.InputStream(
-    samplerate=SAMPLE_RATE,
-    channels=1,
-    dtype='float32',
-    blocksize=1024,
-    callback=audio_callback,
-):
-
-    print("Calibrating... stay silent")
-
-    noise_samples = []
-    for _ in range(30):
-        chunk = audio_queue.get()
-        noise_samples.append(np.mean(np.abs(chunk)))
-
-    avg_noise = np.mean(noise_samples)
-
-    ENERGY_THRESHOLD = avg_noise * 4
-
-    print(f"✅ Threshold: {ENERGY_THRESHOLD:.6f}")
-    print("🎙️ Agent is listening... Speak now!")
-
-    # ==============================
-    # VAD
-    # ==============================
-    def is_speech(audio_chunk):
-        energy = np.mean(np.abs(audio_chunk))
-        return energy > ENERGY_THRESHOLD
-
-    # ==============================
-    # MAIN LOOP
-    # ==============================
-    while True:
-        audio_chunk = audio_queue.get()
-        current_time = time.time()
-
-        speech = is_speech(audio_chunk)
-
-        # 🔴 IGNORE mic while speaking (KEY FIX)
-        if is_speaking:
-            continue
-
-        # ==========================
-        # USER SPEAKING
-        # ==========================
-        if speech:
+        # if user stopped speaking
+        if is_listening and silence_frames > 10:
+            is_listening = False
             silence_frames = 0
-            last_speech_time = current_time
-            is_listening = True
-            recording.append(audio_chunk)
+            asyncio.create_task(process_audio(client))
 
-        # ==========================
-        # USER SILENCE
-        # ==========================
-        else:
-            silence_frames += 1
+async def process_audio(client):
+    try:
+        state.set_speaking()
 
-            if is_listening and (
-                silence_frames > SILENCE_FRAMES_REQUIRED
-                or len(recording) > SAMPLE_RATE * MAX_RECORD_SECONDS
-            ):
+        audio_data = state.get_audio()
+        state.clear_audio()
 
-                duration = sum(len(c) for c in recording) / SAMPLE_RATE
+        if len(audio_data) < 16000:
+            return
 
-                if duration < MIN_AUDIO_LENGTH:
-                    recording = []
-                    is_listening = False
-                    silence_frames = 0
-                    continue
+        loop = asyncio.get_event_loop()
 
-                print("🧠 Processing speech...")
+        # 🔥 Run Whisper in background thread
+        text = await loop.run_in_executor(
+            None,
+            transcribe_audio,
+            audio_data
+        )
 
-                full_audio = np.concatenate(recording, axis=0)
-                text = transcribe(full_audio)
+        if not text:
+            return
 
-                print(f"👤 You said: {text}")
+        print("\n🧠 Transcribing...")
+        print("👤 User:", text)
 
-                # ✅ RESET BEFORE SPEAK (CRITICAL FIX)
-                recording = []
-                is_listening = False
-                silence_frames = 0
+        response = f"You said: {text}"
+        print("🤖 Agent:", response)
 
-                if text:
-                    speak(f"You said: {text}")
+        # 🔥 Run TTS in background thread
+        tts_audio = await loop.run_in_executor(
+            None,
+            text_to_audio_bytes,
+            response
+        )
 
-        # ==========================
-        # LONG SILENCE REMINDER
-        # ==========================
-        if current_time - last_speech_time > SILENCE_TIMEOUT:
-            if not is_speaking:
-                speak("Are you still there?")
-                last_speech_time = current_time
+        print("Publishing bytes:", len(tts_audio))
+
+        await client.publish_audio(tts_audio)
+
+    except Exception as e:
+        print("Error:", e)
+
+    finally:
+        await asyncio.sleep(0.5)
+        state.set_idle()
+
+
+async def main():
+    client = LiveKitClient()   # ← create inside event loop
+    client.on_audio_received(lambda audio: audio_handler(audio, client))
+    await client.connect()
+    await client.run()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
