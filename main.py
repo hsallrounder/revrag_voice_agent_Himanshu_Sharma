@@ -25,12 +25,7 @@ def audio_handler(audio_bytes, client):
     if state.is_speaking():
         return
 
-    audio_np = np.frombuffer(audio_bytes, np.int16).astype(np.float32) / 32768.0
-    energy = np.mean(np.abs(audio_np))
-
-    SPEECH_THRESHOLD = 0.01  # adjust if needed
-
-    if energy > SPEECH_THRESHOLD:
+    if is_speech(audio_bytes):
         silence_frames = 0
         is_listening = True
         state.add_audio(audio_bytes)
